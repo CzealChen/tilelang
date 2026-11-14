@@ -12,6 +12,11 @@ namespace tl {
 
 using namespace tirx;
 
+TIR_DEFINE_TL_BUILTIN(metal_cumsum)
+    .set_num_inputs(5)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(cooperative_tensor_fill)
     .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",

@@ -7,6 +7,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tirx/analysis.h>
 #include <tvm/tirx/stmt_functor.h>
 #include <tvm/tirx/transform.h>
 
@@ -28,6 +29,115 @@ namespace tvm {
 namespace codegen {
 
 namespace {
+
+// cumsum is a whole-threadgroup collective. Its MSL helper uses threadIdx.x
+// as the lane index, so reject launches and control flow that violate that
+// contract before compiling or launching a shader.
+class MetalScanVerifier : public StmtExprVisitor {
+public:
+  static void Verify(const PrimFunc &func) {
+    if (ContainsScan(func->body)) {
+      MetalScanVerifier verifier;
+      verifier(func->body);
+    }
+  }
+
+private:
+  static bool ContainsScan(const Stmt &stmt) {
+    bool found = false;
+    PostOrderVisit(stmt, [&](const ffi::ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>()) {
+        found |= call->op.same_as(tl::metal_cumsum());
+      }
+    });
+    return found;
+  }
+
+  bool IsUniform(const PrimExpr &expr) const {
+    if (SideEffect(expr) > CallEffectKind::kPure) {
+      return false;
+    }
+    bool uniform = true;
+    PostOrderVisit(expr, [&](const ffi::ObjectRef &node) {
+      if (const auto *var = node.as<VarNode>()) {
+        uniform &= !thread_dependent_.count(ffi::GetRef<Var>(var));
+      }
+      // A value loaded from memory can carry a per-thread result even when
+      // its index is constant (for example a local predicate buffer).
+      uniform &= !node->IsInstance<BufferLoadNode>();
+    });
+    return uniform;
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tirx::attr::thread_extent) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      if (iv->thread_tag == "threadIdx.x" || iv->thread_tag == "threadIdx.y" ||
+          iv->thread_tag == "threadIdx.z") {
+        thread_dependent_.insert(iv->var);
+        if (iv->thread_tag != "threadIdx.x") {
+          const auto *extent = op->value.as<IntImmNode>();
+          CHECK(extent && extent->value == 1, ValueError)
+              << "Metal cumsum requires a one-dimensional threadgroup";
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BindNode *op) final {
+    if (!IsUniform(op->value)) {
+      thread_dependent_.insert(op->var);
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    CHECK(!ContainsScan(ffi::GetRef<IfThenElse>(op)) ||
+              IsUniform(op->condition),
+          ValueError)
+        << "Metal cumsum requires block-uniform control flow; move the scan "
+           "outside thread-dependent or memory-dependent conditions";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    CHECK(!ContainsScan(op->body) ||
+              (IsUniform(op->min) && IsUniform(op->extent) &&
+               (!op->step.has_value() || IsUniform(op->step.value()))),
+          ValueError)
+        << "Metal cumsum requires block-uniform loop bounds";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    CHECK(!ContainsScan(op->body), ValueError)
+        << "Metal cumsum does not yet support while loops; use a "
+           "block-uniform serial loop";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(tl::metal_cumsum())) {
+      for (int i : {0, 1}) {
+        const auto *ptr = op->args[i].as<CallNode>();
+        ICHECK(ptr && ptr->op.same_as(tirx::builtin::address_of()));
+        const auto *load = ptr->args[0].as<BufferLoadNode>();
+        ICHECK(load);
+        bool uniform = IsUniform(load->buffer->data);
+        for (const PrimExpr &index : load->indices) {
+          uniform &= IsUniform(index);
+        }
+        CHECK(uniform, ValueError)
+            << "Metal cumsum requires block-uniform region offsets";
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      thread_dependent_;
+};
 
 class CooperativeTensorUseCollector : public StmtExprVisitor {
 public:
@@ -117,6 +227,7 @@ void CodeGenTileLangMetal::EmitPreamble_(std::ostream &os) const {
 
 void CodeGenTileLangMetal::AddFunction(const GlobalVar &gvar,
                                        const PrimFunc &func) {
+  MetalScanVerifier::Verify(func);
   // NOTE: There is no inter-function calls among Metal kernels.
   // For now we keep the metal codegen without inter-function call
   // process.
@@ -1670,6 +1781,37 @@ void CodeGenTileLangMetal::VisitExpr_(const CallNode *op,
          << "; __i++) " << c_var << "[" << c_idx << " * " << c_elems
          << " + __i] = __ct_c[__i]; }";
     }
+  } else if (op->op.same_as(tl::metal_cumsum())) {
+    if (!declared_cumsum_) {
+      decl_stream << R"(
+// The caller synchronizes the whole threadgroup before and after this helper.
+// Only the first complete SIMD-group scans; inactive tail lanes contribute 0.
+template <typename T>
+inline void tl_metal_cumsum(threadgroup const T* src, threadgroup T* dst,
+                            int n, int tid, bool reverse) {
+  if (tid < 32) {
+    T carry = T(0);
+    for (int base = 0; base < n; base += 32) {
+      int k = base + tid;
+      int index = reverse ? n - 1 - k : k;
+      T value = k < n ? src[index] : T(0);
+      T prefix = simd_prefix_inclusive_sum(value);
+      if (k < n) dst[index] = prefix + carry;
+      carry += simd_shuffle(prefix, ushort(31));
+    }
+  }
+}
+
+)";
+      declared_cumsum_ = true;
+    }
+    os << "tl_metal_cumsum(";
+    PrintExpr(op->args[0], os);
+    for (size_t i = 1; i < op->args.size(); ++i) {
+      os << ", ";
+      PrintExpr(op->args[i], os);
+    }
+    os << ")";
   } else if (op->op.same_as(tl::atomic_add_elem_op()) ||
              op->op.same_as(tl::atomic_add_ret_elem_op())) {
     TVM_FFI_ICHECK_GE(op->args.size(), 2U);

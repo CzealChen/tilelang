@@ -466,7 +466,34 @@ descriptor shape described in Section 1.3.
 | MLX-style block swizzle | Implemented | Block-level rasterization |
 | simdgroup GEMM | Implemented | Compatibility path, Section 3.2 |
 | simdgroup id / lane id lowering | Implemented | Also used by cooperative tensor kernels |
+| One-dimensional `T.cumsum` | Implemented | int32/float32 shared-memory inclusive scan; see below |
 | `const` / `__restrict` parameter emission | Implemented | Improves MSL alias information |
+
+`T.cumsum` supports one-dimensional, linearly laid out `shared` and
+`shared.dyn` buffers with matching int32 or float32 dtypes. The region length
+must be a positive compile-time constant. Forward and reverse scans, nonzero
+region offsets, exact in-place scans, and disjoint source/destination regions
+are supported. A scan operates on its tile or region, not across threadgroups.
+Ordinary fragment inputs reuse the frontend's shared-memory staging macro;
+opaque simdgroup GEMM accumulators are outside this contract.
+
+Use a one-dimensional threadgroup whose size is a multiple of 32. All threads
+must reach the operation together. Region offsets and surrounding conditions
+and serial-loop bounds must be provably block-uniform; thread-dependent or
+memory-dependent control flow and while loops are rejected. The current
+implementation does not support two-dimensional scans, dynamic region lengths,
+FP16/BF16, partially overlapping regions, or `T.cummax`.
+
+The Metal lowering registers a backend-owned intrinsic with read/write access
+pointers and explicit threadgroup synchronization before and after the call.
+An MSL helper uses `simd_prefix_inclusive_sum` in the first SIMD-group, scanning
+successive 32-element segments and carrying their sums forward. Tail lanes
+contribute zero while still participating in the collective. Keeping the
+lane-level loop inside the helper prevents generic loop and synchronization
+passes from introducing a threadgroup barrier inside its SIMD-group guard.
+This is a functional baseline; long scans do not yet distribute work across
+multiple SIMD-groups. Floating-point results may differ from serial summation
+because of reassociation.
 
 ### 5.5 Known Limitations and Roadmap
 

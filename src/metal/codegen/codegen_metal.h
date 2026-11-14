@@ -91,6 +91,7 @@ private:
   bool emitted_metal_simdgroup_id_{false};
   bool emitted_frag_lane_vars_{false};
   bool uses_cooperative_tensor_{false};
+  bool declared_cumsum_{false};
   bool needs_fragment_lane_vars_{false};
   int thread_index_bits_{32};
   int thread_work_dim_{0};

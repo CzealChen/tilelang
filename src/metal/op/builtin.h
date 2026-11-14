@@ -11,6 +11,8 @@
 namespace tvm {
 namespace tl {
 
+TVM_DLL const Op &metal_cumsum();
+
 // Metal cooperative tensor operations.
 
 TVM_DLL const Op &cooperative_tensor_fill();
